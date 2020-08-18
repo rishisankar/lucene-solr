@@ -35,6 +35,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Phaser;
@@ -54,10 +56,8 @@ import org.apache.solr.client.solrj.embedded.SSLConfig;
 import org.apache.solr.client.solrj.request.RequestWriter;
 import org.apache.solr.client.solrj.request.UpdateRequest;
 import org.apache.solr.client.solrj.request.V2Request;
-import org.apache.solr.client.solrj.util.Cancellable;
 import org.apache.solr.client.solrj.util.ClientUtils;
 import org.apache.solr.client.solrj.util.Constants;
-import org.apache.solr.client.solrj.util.AsyncListener;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.StringUtils;
 import org.apache.solr.common.params.CommonParams;
@@ -369,16 +369,15 @@ public class Http2SolrClient extends SolrClient {
     outStream.flush();
   }
 
-  private static final Exception CANCELLED_EXCEPTION = new Exception();
-  private static final Cancellable FAILED_MAKING_REQUEST_CANCELLABLE = () -> {};
-
-  public Cancellable asyncRequest(@SuppressWarnings({"rawtypes"}) SolrRequest solrRequest, String collection, AsyncListener<NamedList<Object>> asyncListener) {
+  @Override
+  public CompletableFuture<NamedList<Object>> requestAsync(SolrRequest<?> solrRequest) {
+    CompletableFuture<NamedList<Object>> future = new CompletableFuture<>();
     Request req;
     try {
-      req = makeRequest(solrRequest, collection);
+      req = makeRequest(solrRequest, solrRequest.getCollection());
     } catch (SolrServerException | IOException e) {
-      asyncListener.onFailure(e);
-      return FAILED_MAKING_REQUEST_CANCELLABLE;
+      future.completeExceptionally(e);
+      return future;
     }
     final ResponseParser parser = solrRequest.getResponseParser() == null
         ? this.parser: solrRequest.getResponseParser();
@@ -394,13 +393,9 @@ public class Http2SolrClient extends SolrClient {
               assert ObjectReleaseTracker.track(is);
               try {
                 NamedList<Object> body = processErrorsAndResponse(solrRequest, parser, response, is);
-                asyncListener.onSuccess(body);
-              } catch (RemoteSolrException e) {
-                if (SolrException.getRootCause(e) != CANCELLED_EXCEPTION) {
-                  asyncListener.onFailure(e);
-                }
-              } catch (SolrServerException e) {
-                asyncListener.onFailure(e);
+                future.complete(body);
+              } catch (RemoteSolrException | SolrServerException e) {
+                future.completeExceptionally(e);
               }
             });
           }
@@ -408,12 +403,16 @@ public class Http2SolrClient extends SolrClient {
           @Override
           public void onFailure(Response response, Throwable failure) {
             super.onFailure(response, failure);
-            if (failure != CANCELLED_EXCEPTION) {
-              asyncListener.onFailure(new SolrServerException(failure.getMessage(), failure));
-            }
+            future.completeExceptionally(new SolrServerException(failure.getMessage(), failure));
           }
         });
-    return () -> req.abort(CANCELLED_EXCEPTION);
+    future.exceptionally((error) -> {
+      if (error instanceof CancellationException) {
+        req.abort(new Exception());
+      }
+      return null;
+    });
+    return future;
   }
 
   @Override
